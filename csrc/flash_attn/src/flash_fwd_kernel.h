@@ -128,6 +128,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     }
     // if (tidx == 0) { printf("m_block = %d, n_block_min = %d, n_block_max = %d\n", m_block, n_block_min, n_block_max); }
 
+    // Rotary embedding setup
+    const bool has_rotary = params.rotary_dim > 0;
+    typename Kernel_traits::GmemTiledCopyRotcossin gmem_tiled_copy_rotary;
+    auto gmem_thr_copy_rotary = gmem_tiled_copy_rotary.get_thread_slice(tidx);
+    typename Kernel_traits::GmemTiledCopyRotcossinCont gmem_tiled_copy_rotary_cont;
+    auto gmem_thr_copy_rotary_cont = gmem_tiled_copy_rotary_cont.get_thread_slice(tidx);
+
     // We iterate over the blocks in reverse order. This is because the last block is the only one
     // that needs masking when we read K and V from global memory. Moreover, iterating in reverse
     // might save us 1 register (we just need n_block instead of both n_block and n_block_max).
@@ -247,8 +254,40 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // Prologue
 
     // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
-    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
-                                       binfo.actual_seqlen_q - m_block * kBlockM);
+    if (!has_rotary) {
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
+                                           binfo.actual_seqlen_q - m_block * kBlockM);
+    } else {
+        // Apply rotary to Q during copy from gmem to smem
+        const index_t row_offset_cossin = (binfo.sum_s_q == -1 ? 0 : binfo.sum_s_q) + m_block * kBlockM;
+        Tensor gCos = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin * (params.rotary_dim / 2)),
+                                  Shape<Int<kBlockM>, Int<kHeadDim / 2>>{},
+                                  make_stride(params.rotary_dim / 2, _1{}));
+        Tensor gSin = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin * (params.rotary_dim / 2)),
+                                  Shape<Int<kBlockM>, Int<kHeadDim / 2>>{},
+                                  make_stride(params.rotary_dim / 2, _1{}));
+        Tensor gCosCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin * (params.rotary_dim / 2)),
+                                      Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                                      make_stride(params.rotary_dim / 2, _1{}));
+        Tensor gSinCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin * (params.rotary_dim / 2)),
+                                      Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                                      make_stride(params.rotary_dim / 2, _1{}));
+        Tensor tRgCos = gmem_thr_copy_rotary.partition_S(gCos);
+        Tensor tRgSin = gmem_thr_copy_rotary.partition_S(gSin);
+        Tensor tRgCosCont = gmem_thr_copy_rotary_cont.partition_S(gCosCont);
+        Tensor tRgSinCont = gmem_thr_copy_rotary_cont.partition_S(gSinCont);
+        if (params.is_rotary_interleaved) {
+            FLASH_NAMESPACE::copy_rotary_interleaved<Is_even_K>(
+                tQgQ, tQsQ, tRgCos, tRgSin, tQcQ, binfo.actual_seqlen_q - m_block * kBlockM,
+                0, params.d, params.rotary_dim
+            );
+        } else {
+            FLASH_NAMESPACE::copy_rotary_contiguous<Is_even_K>(
+                tQgQ, tQsQ, tRgCosCont, tRgSinCont, tQcQ, binfo.actual_seqlen_q - m_block * kBlockM,
+                0, params.d, params.rotary_dim
+            );
+        }
+    }
     if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
 
     // // if (cute::thread(1, 0)) { print(tQsQ); }
@@ -266,8 +305,40 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
-    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
-                                       binfo.actual_seqlen_k - n_block * kBlockN);
+    if (!has_rotary) {
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
+                                           binfo.actual_seqlen_k - n_block * kBlockN);
+    } else {
+        // Apply rotary to K during copy from gmem to smem
+        const index_t row_offset_cossin = (binfo.sum_s_k == -1 ? binfo.leftpad_k : binfo.sum_s_k + binfo.leftpad_k) + n_block * kBlockN;
+        Tensor gCosK = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin * (params.rotary_dim / 2)),
+                                  Shape<Int<kBlockN>, Int<kHeadDim / 2>>{},
+                                  make_stride(params.rotary_dim / 2, _1{}));
+        Tensor gSinK = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin * (params.rotary_dim / 2)),
+                                  Shape<Int<kBlockN>, Int<kHeadDim / 2>>{},
+                                  make_stride(params.rotary_dim / 2, _1{}));
+        Tensor gCosKCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin * (params.rotary_dim / 2)),
+                                      Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                      make_stride(params.rotary_dim / 2, _1{}));
+        Tensor gSinKCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin * (params.rotary_dim / 2)),
+                                      Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                      make_stride(params.rotary_dim / 2, _1{}));
+        Tensor tRgCosK = gmem_thr_copy_rotary.partition_S(gCosK);
+        Tensor tRgSinK = gmem_thr_copy_rotary.partition_S(gSinK);
+        Tensor tRgCosKCont = gmem_thr_copy_rotary_cont.partition_S(gCosKCont);
+        Tensor tRgSinKCont = gmem_thr_copy_rotary_cont.partition_S(gSinKCont);
+        if (params.is_rotary_interleaved) {
+            FLASH_NAMESPACE::copy_rotary_interleaved<Is_even_K>(
+                tKgK(_, _, _, n_block), tKsK, tRgCosK, tRgSinK, tKVcKV, binfo.actual_seqlen_k - n_block * kBlockN,
+                0, params.d, params.rotary_dim
+            );
+        } else {
+            FLASH_NAMESPACE::copy_rotary_contiguous<Is_even_K>(
+                tKgK(_, _, _, n_block), tKsK, tRgCosKCont, tRgSinKCont, tKVcKV, binfo.actual_seqlen_k - n_block * kBlockN,
+                0, params.d, params.rotary_dim
+            );
+        }
+    }
     cute::cp_async_fence();
     // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z < 2) { print(tKgK); }
     // __syncthreads();
@@ -332,7 +403,38 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
         if (n_block > n_block_min) {
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+            if (!has_rotary) {
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+            } else {
+                const index_t row_offset_cossin = (binfo.sum_s_k == -1 ? binfo.leftpad_k : binfo.sum_s_k + binfo.leftpad_k) + (n_block - 1) * kBlockN;
+                Tensor gCosK = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin * (params.rotary_dim / 2)),
+                                          Shape<Int<kBlockN>, Int<kHeadDim / 2>>{},
+                                          make_stride(params.rotary_dim / 2, _1{}));
+                Tensor gSinK = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin * (params.rotary_dim / 2)),
+                                          Shape<Int<kBlockN>, Int<kHeadDim / 2>>{},
+                                          make_stride(params.rotary_dim / 2, _1{}));
+                Tensor gCosKCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin * (params.rotary_dim / 2)),
+                                              Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                              make_stride(params.rotary_dim / 2, _1{}));
+                Tensor gSinKCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin * (params.rotary_dim / 2)),
+                                              Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                              make_stride(params.rotary_dim / 2, _1{}));
+                Tensor tRgCosK = gmem_thr_copy_rotary.partition_S(gCosK);
+                Tensor tRgSinK = gmem_thr_copy_rotary.partition_S(gSinK);
+                Tensor tRgCosKCont = gmem_thr_copy_rotary_cont.partition_S(gCosKCont);
+                Tensor tRgSinKCont = gmem_thr_copy_rotary_cont.partition_S(gSinKCont);
+                if (params.is_rotary_interleaved) {
+                    FLASH_NAMESPACE::copy_rotary_interleaved<Is_even_K>(
+                        tKgK(_, _, _, n_block - 1), tKsK, tRgCosK, tRgSinK, tKVcKV, binfo.actual_seqlen_k,
+                        0, params.d, params.rotary_dim
+                    );
+                } else {
+                    FLASH_NAMESPACE::copy_rotary_contiguous<Is_even_K>(
+                        tKgK(_, _, _, n_block - 1), tKsK, tRgCosKCont, tRgSinKCont, tKVcKV, binfo.actual_seqlen_k,
+                        0, params.d, params.rotary_dim
+                    );
+                }
+            }
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
             cute::cp_async_fence();
@@ -394,7 +496,38 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
         if (n_block > n_block_min) {
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+            if (!has_rotary) {
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+            } else {
+                const index_t row_offset_cossin = (binfo.sum_s_k == -1 ? binfo.leftpad_k : binfo.sum_s_k + binfo.leftpad_k) + (n_block - 1) * kBlockN;
+                Tensor gCosK = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin * (params.rotary_dim / 2)),
+                                          Shape<Int<kBlockN>, Int<kHeadDim / 2>>{},
+                                          make_stride(params.rotary_dim / 2, _1{}));
+                Tensor gSinK = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin * (params.rotary_dim / 2)),
+                                          Shape<Int<kBlockN>, Int<kHeadDim / 2>>{},
+                                          make_stride(params.rotary_dim / 2, _1{}));
+                Tensor gCosKCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin * (params.rotary_dim / 2)),
+                                              Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                              make_stride(params.rotary_dim / 2, _1{}));
+                Tensor gSinKCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin * (params.rotary_dim / 2)),
+                                              Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                              make_stride(params.rotary_dim / 2, _1{}));
+                Tensor tRgCosK = gmem_thr_copy_rotary.partition_S(gCosK);
+                Tensor tRgSinK = gmem_thr_copy_rotary.partition_S(gSinK);
+                Tensor tRgCosKCont = gmem_thr_copy_rotary_cont.partition_S(gCosKCont);
+                Tensor tRgSinKCont = gmem_thr_copy_rotary_cont.partition_S(gSinKCont);
+                if (params.is_rotary_interleaved) {
+                    FLASH_NAMESPACE::copy_rotary_interleaved<Is_even_K>(
+                        tKgK(_, _, _, n_block - 1), tKsK, tRgCosK, tRgSinK, tKVcKV, binfo.actual_seqlen_k,
+                        0, params.d, params.rotary_dim
+                    );
+                } else {
+                    FLASH_NAMESPACE::copy_rotary_contiguous<Is_even_K>(
+                        tKgK(_, _, _, n_block - 1), tKsK, tRgCosKCont, tRgSinKCont, tKVcKV, binfo.actual_seqlen_k,
+                        0, params.d, params.rotary_dim
+                    );
+                }
+            }
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
             cute::cp_async_fence();
@@ -783,11 +916,11 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     }
 
     // Read Q from gmem to smem, optionally apply rotary embedding.
-    if (!Append_KV || params.rotary_dim == 0) {
+    if (params.rotary_dim == 0) {
         // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
         FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
                                            binfo.actual_seqlen_q - m_block * kBlockM);
-    } else {
+    } else if constexpr (Append_KV) {
         const index_t row_offset_cossin = (binfo.seqlen_k_cache + (params.leftpad_k == nullptr ? 0 : params.leftpad_k[bidb]) + (Is_causal || Is_local ? m_block * kBlockM : 0)) * (params.rotary_dim / 2);
         // If not causal, all the queries get the same the cos/sin, taken at location seqlen_k_cache.
         // We do this by setting the row stride of gCos / gSin to 0.
@@ -818,12 +951,79 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 0, params.d, params.rotary_dim
             );
         }
+    } else {
+        // Varlen prefill: rotary_cos / rotary_sin are aligned to the packed Q token order.
+        const index_t row_offset_cossin = (uint32_t(binfo.sum_s_q) + m_block * kBlockM) * (params.rotary_dim / 2);
+        Tensor gCos = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin),
+                                  Shape<Int<kBlockM>, Int<kHeadDim / 2>>{},
+                                  make_stride(params.rotary_dim / 2, _1{}));
+        Tensor gSin = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin),
+                                  Shape<Int<kBlockM>, Int<kHeadDim / 2>>{},
+                                  make_stride(params.rotary_dim / 2, _1{}));
+        Tensor gCosCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin),
+                                  Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                                  make_stride(params.rotary_dim / 2, _1{}));
+        Tensor gSinCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin),
+                                  Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                                  make_stride(params.rotary_dim / 2, _1{}));
+        Tensor tRgCos = gmem_thr_copy_rotary.partition_S(gCos);
+        Tensor tRgSin = gmem_thr_copy_rotary.partition_S(gSin);
+        Tensor tRgCosCont = gmem_thr_copy_rotary_cont.partition_S(gCosCont);
+        Tensor tRgSinCont = gmem_thr_copy_rotary_cont.partition_S(gSinCont);
+        if (params.is_rotary_interleaved) {
+            FLASH_NAMESPACE::copy_rotary_interleaved<Is_even_K>(
+                tQgQ, tQsQ, tRgCos, tRgSin, tQcQ, binfo.actual_seqlen_q - m_block * kBlockM,
+                0, params.d, params.rotary_dim
+            );
+        } else {
+            FLASH_NAMESPACE::copy_rotary_contiguous<Is_even_K>(
+                tQgQ, tQsQ, tRgCosCont, tRgSinCont, tQcQ, binfo.actual_seqlen_q - m_block * kBlockM,
+                0, params.d, params.rotary_dim
+            );
+        }
     }
 
     int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
-    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV,
-                                       binfo.actual_seqlen_k - n_block * kBlockN);
+    if constexpr (!Append_KV) {
+        if (params.rotary_dim == 0) {
+            FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV,
+                                               binfo.actual_seqlen_k - n_block * kBlockN);
+        } else {
+            // Varlen prefill: rotary_cos / rotary_sin are aligned to the packed K token order.
+            const index_t row_offset_cossin = (uint32_t(binfo.sum_s_k) + binfo.leftpad_k + n_block * kBlockN) * (params.rotary_dim / 2);
+            Tensor gCos = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin),
+                                      Shape<Int<kBlockN>, Int<kHeadDim / 2>>{},
+                                      make_stride(params.rotary_dim / 2, _1{}));
+            Tensor gSin = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin),
+                                      Shape<Int<kBlockN>, Int<kHeadDim / 2>>{},
+                                      make_stride(params.rotary_dim / 2, _1{}));
+            Tensor gCosCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin),
+                                      Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                      make_stride(params.rotary_dim / 2, _1{}));
+            Tensor gSinCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin),
+                                      Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                      make_stride(params.rotary_dim / 2, _1{}));
+            Tensor tRgCos = gmem_thr_copy_rotary.partition_S(gCos);
+            Tensor tRgSin = gmem_thr_copy_rotary.partition_S(gSin);
+            Tensor tRgCosCont = gmem_thr_copy_rotary_cont.partition_S(gCosCont);
+            Tensor tRgSinCont = gmem_thr_copy_rotary_cont.partition_S(gSinCont);
+            if (params.is_rotary_interleaved) {
+                FLASH_NAMESPACE::copy_rotary_interleaved<Is_even_K>(
+                    tKgK, tKsK, tRgCos, tRgSin, tKVcKV, binfo.actual_seqlen_k - n_block * kBlockN,
+                    0, params.d, params.rotary_dim
+                );
+            } else {
+                FLASH_NAMESPACE::copy_rotary_contiguous<Is_even_K>(
+                    tKgK, tKsK, tRgCosCont, tRgSinCont, tKVcKV, binfo.actual_seqlen_k - n_block * kBlockN,
+                    0, params.d, params.rotary_dim
+                );
+            }
+        }
+    } else {
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV,
+                                           binfo.actual_seqlen_k - n_block * kBlockN);
+    }
     cute::cp_async_fence();
 
     // FLASH_NAMESPACE::cp_async_wait<0>();
@@ -906,7 +1106,43 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 const int block_table_offset_next =(n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
                 tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
             }
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+            if constexpr (!Append_KV) {
+                if (params.rotary_dim == 0) {
+                    FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+                } else {
+                    const int n_block_k = n_block - 1;
+                    const index_t row_offset_cossin = (uint32_t(binfo.sum_s_k) + binfo.leftpad_k + n_block_k * kBlockN) * (params.rotary_dim / 2);
+                    Tensor gCos = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin),
+                                              Shape<Int<kBlockN>, Int<kHeadDim / 2>>{},
+                                              make_stride(params.rotary_dim / 2, _1{}));
+                    Tensor gSin = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin),
+                                              Shape<Int<kBlockN>, Int<kHeadDim / 2>>{},
+                                              make_stride(params.rotary_dim / 2, _1{}));
+                    Tensor gCosCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin),
+                                              Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                              make_stride(params.rotary_dim / 2, _1{}));
+                    Tensor gSinCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin),
+                                              Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                              make_stride(params.rotary_dim / 2, _1{}));
+                    Tensor tRgCos = gmem_thr_copy_rotary.partition_S(gCos);
+                    Tensor tRgSin = gmem_thr_copy_rotary.partition_S(gSin);
+                    Tensor tRgCosCont = gmem_thr_copy_rotary_cont.partition_S(gCosCont);
+                    Tensor tRgSinCont = gmem_thr_copy_rotary_cont.partition_S(gSinCont);
+                    if (params.is_rotary_interleaved) {
+                        FLASH_NAMESPACE::copy_rotary_interleaved<Is_even_K>(
+                            tKgK, tKsK, tRgCos, tRgSin, tKVcKV, binfo.actual_seqlen_k - n_block_k * kBlockN,
+                            0, params.d, params.rotary_dim
+                        );
+                    } else {
+                        FLASH_NAMESPACE::copy_rotary_contiguous<Is_even_K>(
+                            tKgK, tKsK, tRgCosCont, tRgSinCont, tKVcKV, binfo.actual_seqlen_k - n_block_k * kBlockN,
+                            0, params.d, params.rotary_dim
+                        );
+                    }
+                }
+            } else {
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+            }
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
             cute::cp_async_fence();
@@ -973,7 +1209,43 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 const int block_table_offset_next = (n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
                 tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
             }
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+            if constexpr (!Append_KV) {
+                if (params.rotary_dim == 0) {
+                    FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+                } else {
+                    const int n_block_k = n_block - 1;
+                    const index_t row_offset_cossin = (uint32_t(binfo.sum_s_k) + binfo.leftpad_k + n_block_k * kBlockN) * (params.rotary_dim / 2);
+                    Tensor gCos = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin),
+                                              Shape<Int<kBlockN>, Int<kHeadDim / 2>>{},
+                                              make_stride(params.rotary_dim / 2, _1{}));
+                    Tensor gSin = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin),
+                                              Shape<Int<kBlockN>, Int<kHeadDim / 2>>{},
+                                              make_stride(params.rotary_dim / 2, _1{}));
+                    Tensor gCosCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin),
+                                              Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                              make_stride(params.rotary_dim / 2, _1{}));
+                    Tensor gSinCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin),
+                                              Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                              make_stride(params.rotary_dim / 2, _1{}));
+                    Tensor tRgCos = gmem_thr_copy_rotary.partition_S(gCos);
+                    Tensor tRgSin = gmem_thr_copy_rotary.partition_S(gSin);
+                    Tensor tRgCosCont = gmem_thr_copy_rotary_cont.partition_S(gCosCont);
+                    Tensor tRgSinCont = gmem_thr_copy_rotary_cont.partition_S(gSinCont);
+                    if (params.is_rotary_interleaved) {
+                        FLASH_NAMESPACE::copy_rotary_interleaved<Is_even_K>(
+                            tKgK, tKsK, tRgCos, tRgSin, tKVcKV, binfo.actual_seqlen_k - n_block_k * kBlockN,
+                            0, params.d, params.rotary_dim
+                        );
+                    } else {
+                        FLASH_NAMESPACE::copy_rotary_contiguous<Is_even_K>(
+                            tKgK, tKsK, tRgCosCont, tRgSinCont, tKVcKV, binfo.actual_seqlen_k - n_block_k * kBlockN,
+                            0, params.d, params.rotary_dim
+                        );
+                    }
+                }
+            } else {
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+            }
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
             cute::cp_async_fence();

@@ -163,8 +163,16 @@ def _flash_attn_varlen_forward(
     leftpad_k: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
+    rotary_cos: Optional[torch.Tensor] = None,
+    rotary_sin: Optional[torch.Tensor] = None,
+    rotary_interleaved: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    if (rotary_cos is None) ^ (rotary_sin is None):
+        raise ValueError("rotary_cos and rotary_sin must be both provided or both None")
+    if rotary_cos is not None:
+        rotary_cos = maybe_contiguous(rotary_cos)
+        rotary_sin = maybe_contiguous(rotary_sin)
     out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.varlen_fwd(
         q,
         k,
@@ -176,6 +184,8 @@ def _flash_attn_varlen_forward(
         leftpad_k,
         block_table,
         alibi_slopes,
+        rotary_cos,
+        rotary_sin,
         max_seqlen_q,
         max_seqlen_k,
         dropout_p,
@@ -186,6 +196,7 @@ def _flash_attn_varlen_forward(
         window_size_right,
         softcap,
         return_softmax,
+        rotary_interleaved,
         None,
     )
     # if out.isnan().any() or softmax_lse.isnan().any():
@@ -214,6 +225,9 @@ def _flash_attn_varlen_forward_fake(
     leftpad_k: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
+    rotary_cos: Optional[torch.Tensor] = None,
+    rotary_sin: Optional[torch.Tensor] = None,
+    rotary_interleaved: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     paged_kv = block_table is not None
@@ -834,6 +848,10 @@ class FlashAttnFunc(torch.autograd.Function):
         is_grad = is_grad_enabled and any(
             x.requires_grad for x in [q, k, v]
         )
+        if (rotary_cos is None) ^ (rotary_sin is None):
+            raise ValueError("rotary_cos and rotary_sin must be both provided or both None")
+        if is_grad and rotary_cos is not None:
+            raise NotImplementedError("rotary embedding is not supported for varlen backward yet")
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         head_size_og = q.size(3)
@@ -921,6 +939,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         return_softmax,
         block_table,
         is_grad_enabled,
+        rotary_cos=None,
+        rotary_sin=None,
+        rotary_interleaved=False,
     ):
         is_grad = is_grad_enabled and any(
             x.requires_grad for x in [q, k, v]
@@ -949,6 +970,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
             block_table=block_table,
+            rotary_cos=rotary_cos,
+            rotary_sin=rotary_sin,
+            rotary_interleaved=rotary_interleaved,
         )
         if is_grad:
             ctx.save_for_backward(
@@ -1002,7 +1026,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        # 3 extra None for rotary_cos, rotary_sin, rotary_interleaved
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -1394,6 +1419,9 @@ def flash_attn_varlen_func(
     deterministic=False,
     return_attn_probs=False,
     block_table=None,
+    rotary_cos=None,
+    rotary_sin=None,
+    rotary_interleaved=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -1441,6 +1469,10 @@ def flash_attn_varlen_func(
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
+        rotary_cos: (total_q, rotary_dim // 2), optional. Cosines for rotary position embedding.
+        rotary_sin: (total_q, rotary_dim // 2), optional. Sines for rotary position embedding.
+        rotary_interleaved: bool. If True, use interleaved rotary (GPT-J style).
+            If False, use contiguous rotary (GPT-NeoX style). Default False.
     Return:
         out: (total, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
@@ -1468,6 +1500,9 @@ def flash_attn_varlen_func(
         return_attn_probs,
         block_table,
         torch.is_grad_enabled(),
+        rotary_cos,
+        rotary_sin,
+        rotary_interleaved,
     )
 
 

@@ -522,6 +522,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                std::optional<const at::Tensor> &leftpad_k_, // batch_size
                std::optional<at::Tensor> &block_table_, // batch_size x max_num_blocks_per_seq
                std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
+               std::optional<const at::Tensor> &rotary_cos_, // max_seqlen x (rotary_dim / 2)
+               std::optional<const at::Tensor> &rotary_sin_, // max_seqlen x (rotary_dim / 2)
                int max_seqlen_q,
                const int max_seqlen_k,
                const float p_dropout,
@@ -532,6 +534,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                int window_size_right,
                const float softcap,
                const bool return_softmax,
+               const bool is_rotary_interleaved,
                std::optional<at::Generator> gen_) {
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -609,8 +612,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     if (window_size_right >= max_seqlen_k) { window_size_right = -1; }
 
     CHECK_SHAPE(q, total_q, num_heads, head_size);
+    const int total_k = paged_KV ? -1 : k.size(0);
     if (!paged_KV) {
-        const int total_k = k.size(0);
         CHECK_SHAPE(k, total_k, num_heads_k, head_size);
         CHECK_SHAPE(v, total_k, num_heads_k, head_size);
     } else {
@@ -733,6 +736,34 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
+
+    // Handle rotary embeddings for varlen
+    if (rotary_cos_.has_value()) {
+        TORCH_CHECK(!paged_KV, "rotary embeddings for varlen are not supported with paged KV yet");
+        auto rotary_cos = rotary_cos_.value();
+        CHECK_DEVICE(rotary_cos);
+        params.rotary_dim = rotary_cos.size(1) * 2;
+        TORCH_CHECK(params.rotary_dim <= head_size, "rotary_dim must be <= headdim");
+        TORCH_CHECK(params.rotary_dim % 16 == 0, "Only rotary dimensions divisible by 16 are currently supported");
+        const int seqlen_ro = rotary_cos.size(0);
+        TORCH_CHECK(seqlen_ro >= total_q, "cos/sin seqlen must be at least total_q for varlen rotary");
+        TORCH_CHECK(total_k < 0 || seqlen_ro >= total_k, "cos/sin seqlen must be at least total_k for varlen rotary");
+        CHECK_SHAPE(rotary_cos, seqlen_ro, params.rotary_dim / 2);
+        CHECK_CONTIGUOUS(rotary_cos);
+        TORCH_CHECK(rotary_cos.scalar_type() == q_dtype, "rotary_cos must have the same dtype as query");
+
+        TORCH_CHECK(rotary_sin_.has_value(), "If rotary cos is provided, rotary sin must also be provided");
+        auto rotary_sin = rotary_sin_.value();
+        CHECK_DEVICE(rotary_sin);
+        CHECK_SHAPE(rotary_sin, seqlen_ro, params.rotary_dim / 2);
+        CHECK_CONTIGUOUS(rotary_sin);
+        TORCH_CHECK(rotary_sin.scalar_type() == q_dtype, "rotary_sin must have the same dtype as query");
+        params.rotary_cos_ptr = rotary_cos.data_ptr();
+        params.rotary_sin_ptr = rotary_sin.data_ptr();
+        params.is_rotary_interleaved = is_rotary_interleaved;
+    } else {
+        params.rotary_dim = 0;
+    }
 
     if (max_seqlen_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
